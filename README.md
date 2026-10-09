@@ -29,6 +29,17 @@ PORT=/dev/ttyACM0 ./flash.sh               # other serial port
    Details: PPP, Query DNS on, IP address Automatic.
 4. Tap **Connect**. The serial monitor shows `Palm connected`, then `PPP up, Palm is 192.168.44.2`.
 
+## Changing Wi-Fi from the Palm
+
+While connected, open `http://192.168.44.1/` in the Palm browser (proxy off). It shows the current network
+and a scan, so you can pick a network, enter its password and tap Connect. This works even when the ESP32 has
+no Wi-Fi, because the page is served over the Bluetooth link. Reconnect the Palm afterwards so it gets the
+new network's DNS server. Only the Palm can use the page; requests from the LAN get 403.
+
+The chosen network is saved to the ESP32's flash. `secrets.h` only seeds the first boot, so editing it later
+has no effect until you run `./build.sh -p /dev/ttyACM0 erase-flash` (with `DOCKER_ARGS` set as in `flash.sh`)
+and reflash.
+
 ## Troubleshooting
 
 - **"DNS works, nothing loads"**: the serial log prints `stats`/`ip`/`tcp` counters every 5 s while the Palm is

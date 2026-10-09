@@ -1,6 +1,8 @@
 // Palm OS Bluetooth -> PPP -> NAT -> Wi-Fi bridge.
 // The Palm connects over RFCOMM (LAN Access, or DUN with AT dialing), we run a PPP server and NAT it onto Wi-Fi.
 #include <ctype.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -15,6 +17,8 @@
 #include "esp_gap_bt_api.h"
 #include "esp_spp_api.h"
 #include "esp_sdp_api.h"
+#include "esp_http_server.h"
+#include "lwip/sockets.h"
 #include "lwip/lwip_napt.h"
 #include "lwip/stats.h"
 #include "netif/ppp/pppapi.h"
@@ -43,6 +47,7 @@ static void set_dcd(uint32_t spp, bool on)
 }
 
 static esp_netif_t *sta;
+static volatile bool wifi_up, scanning;
 static ppp_pcb *ppp;
 static struct netif ppp_netif;
 static uint32_t spp_handle;  // 0 = no Palm connected
@@ -330,10 +335,12 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAG, "Wi-Fi disconnected, reason %d", ((wifi_event_sta_disconnected_t *)data)->reason);
-        esp_wifi_connect();
+        wifi_up = false;
+        if (!scanning) esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        wifi_up = true;
         ESP_LOGI(TAG, "Wi-Fi up, " IPSTR, IP2STR(&((ip_event_got_ip_t *)data)->ip_info.ip));
     }
 }
@@ -345,15 +352,179 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL));
-    wifi_config_t wc = {.sta = {.ssid = WIFI_SSID, .password = WIFI_PASS}};
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    // The driver keeps the last config in NVS: secrets.h only seeds it, the setup page overrides it.
+    wifi_config_t wc;
+    if (esp_wifi_get_config(WIFI_IF_STA, &wc) != ESP_OK || !wc.sta.ssid[0]) {
+        wifi_config_t def = {.sta = {.ssid = WIFI_SSID, .password = WIFI_PASS}};
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &def));
+    }
 #ifdef WIFI_MAC
     uint8_t mac[6] = WIFI_MAC;  // optional override from secrets.h
     ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, mac));
 #endif
     ESP_ERROR_CHECK(esp_wifi_set_country_code(WIFI_COUNTRY, true));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+// ---- Setup page: http://192.168.44.1/ from the Palm ----
+// Plain HTML 3.2, sent in one piece (no chunked encoding for old browsers). httpd serves one request
+// at a time, so the static buffers are safe.
+
+#define SCAN_MAX 15
+static char page[8192];
+static size_t page_len;
+
+static void out(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    page_len += vsnprintf(page + page_len, sizeof(page) - page_len, fmt, ap);
+    va_end(ap);
+    if (page_len >= sizeof(page)) page_len = sizeof(page) - 1;
+}
+
+static const char *esc(const char *s)  // SSIDs come off the air: escape before putting them in HTML
+{
+    static char b[32 * 6 + 1];
+    char *o = b;
+    for (; *s && o < b + sizeof(b) - 7; s++) {
+        const char *e = *s == '<' ? "&lt;" : *s == '>' ? "&gt;" : *s == '&' ? "&amp;" : *s == '"' ? "&quot;" : NULL;
+        if (e) o = stpcpy(o, e);
+        else *o++ = *s;
+    }
+    *o = 0;
+    return b;
+}
+
+static esp_err_t send_page(httpd_req_t *r)
+{
+    esp_err_t e = httpd_resp_send(r, page, page_len);
+    page_len = 0;
+    return e;
+}
+
+// Only the Palm (PPP side) may change Wi-Fi; LAN hosts get 403.
+static bool from_palm(httpd_req_t *r)
+{
+    static const uint8_t v4mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    struct sockaddr_storage sa;
+    socklen_t n = sizeof(sa);
+    if (getpeername(httpd_req_to_sockfd(r), (struct sockaddr *)&sa, &n) != 0) return false;
+    const uint8_t *a;
+    if (sa.ss_family == AF_INET6) {
+        a = ((struct sockaddr_in6 *)&sa)->sin6_addr.s6_addr;
+        if (memcmp(a, v4mapped, 12) != 0) return false;
+        a += 12;
+    } else {
+        a = (const uint8_t *)&((struct sockaddr_in *)&sa)->sin_addr.s_addr;
+    }
+    return a[0] == 192 && a[1] == 168 && a[2] == 44;
+}
+
+static esp_err_t page_root(httpd_req_t *r)
+{
+    if (!from_palm(r)) return httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "Palm only");
+    wifi_config_t wc = {0};
+    esp_wifi_get_config(WIFI_IF_STA, &wc);
+    out("<html><head><title>PalmBridge</title></head><body><h3>PalmBridge Wi-Fi</h3><p><b>%s</b>: ",
+        esc((char *)wc.sta.ssid));
+    if (wifi_up) {
+        esp_netif_ip_info_t ip;
+        esp_netif_get_ip_info(sta, &ip);
+        out("connected, " IPSTR "</p>", IP2STR(&ip.ip));
+    } else {
+        out("not connected</p>");
+    }
+
+    static wifi_ap_record_t aps[SCAN_MAX];
+    uint16_t n = SCAN_MAX;
+    // A scan fails while the driver is busy reconnecting, so pause reconnects for its duration.
+    if (!wifi_up) {
+        scanning = true;
+        esp_wifi_disconnect();
+    }
+    if (esp_wifi_scan_start(NULL, true) != ESP_OK || esp_wifi_scan_get_ap_records(&n, aps) != ESP_OK) n = 0;
+    if (scanning) {
+        scanning = false;
+        esp_wifi_connect();
+    }
+
+    out("<form method=post action=/save>");
+    if (!n) out("<p>Scan failed, <a href=/>retry</a>.</p>");
+    for (int i = 0; i < n; i++) {
+        const char *s = (char *)aps[i].ssid;
+        bool dup = !s[0];  // hidden
+        for (int j = 0; j < i && !dup; j++) dup = strcmp(s, (char *)aps[j].ssid) == 0;
+        if (dup) continue;
+        out("<input type=radio name=ssid value=\"%s\"%s>", esc(s), strcmp(s, (char *)wc.sta.ssid) ? "" : " checked");
+        out("%s (%d)%s<br>", esc(s), aps[i].rssi, aps[i].authmode == WIFI_AUTH_OPEN ? " open" : "");
+    }
+    out("<input type=radio name=ssid value=\"\">Other: <input name=other size=16><br>"
+        "Password: <input type=password name=pass size=16><br>"
+        "<input type=submit value=Connect></form><p><a href=/>Rescan</a></p></body></html>");
+    return send_page(r);
+}
+
+static void url_decode(char *s)
+{
+    char *o = s;
+    for (; *s; s++) {
+        if (*s == '+') {
+            *o++ = ' ';
+        } else if (*s == '%' && isxdigit((int)s[1]) && isxdigit((int)s[2])) {
+            char h[3] = {s[1], s[2], 0};
+            *o++ = strtol(h, NULL, 16);
+            s += 2;
+        } else {
+            *o++ = *s;
+        }
+    }
+    *o = 0;
+}
+
+static esp_err_t page_save(httpd_req_t *r)
+{
+    if (!from_palm(r)) return httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "Palm only");
+    char body[512], ssid[100] = "", other[100] = "", pass[200] = "";
+    if (r->content_len >= sizeof(body)) return httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "Too long");
+    for (int got = 0, k; got < r->content_len; got += k) {
+        if ((k = httpd_req_recv(r, body + got, r->content_len - got)) <= 0) return ESP_FAIL;
+    }
+    body[r->content_len] = 0;
+    httpd_query_key_value(body, "ssid", ssid, sizeof(ssid));
+    httpd_query_key_value(body, "other", other, sizeof(other));
+    httpd_query_key_value(body, "pass", pass, sizeof(pass));
+    url_decode(ssid);
+    url_decode(other);
+    url_decode(pass);
+    if (!ssid[0]) strcpy(ssid, other);
+    size_t sl = strlen(ssid), pl = strlen(pass);
+    if (!sl || sl > 32 || pl > 64 || (pl && pl < 8)) {
+        return httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "SSID 1-32 chars, password empty or 8-64");
+    }
+
+    wifi_config_t wc = {0};
+    memcpy(wc.sta.ssid, ssid, sl);
+    memcpy(wc.sta.password, pass, pl);
+    ESP_LOGI(TAG, "setup page: switching Wi-Fi to %s", ssid);
+    esp_wifi_set_config(WIFI_IF_STA, &wc);  // saved to NVS
+    esp_wifi_disconnect();                  // disconnect handler reconnects with the new config
+    out("<html><head><title>PalmBridge</title></head><body><p>Connecting to <b>%s</b>...</p>"
+        "<p>Check <a href=/>status</a> in a few seconds. Reconnect the Palm afterwards to pick up "
+        "the new network's DNS.</p></body></html>", esc(ssid));
+    return send_page(r);
+}
+
+static void http_init(void)
+{
+    httpd_handle_t h;
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    ESP_ERROR_CHECK(httpd_start(&h, &cfg));
+    httpd_uri_t root = {.uri = "/", .method = HTTP_GET, .handler = page_root};
+    httpd_uri_t save = {.uri = "/save", .method = HTTP_POST, .handler = page_save};
+    httpd_register_uri_handler(h, &root);
+    httpd_register_uri_handler(h, &save);
 }
 
 static void stats_task(void *arg)
@@ -387,6 +558,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     wifi_init();
+    http_init();
     tx_rb = xRingbufferCreate(16 * 1024, RINGBUF_TYPE_BYTEBUF);
     tx_lock = xSemaphoreCreateMutex();
     xTaskCreate(stats_task, "stats", 2560, NULL, 1, NULL);
